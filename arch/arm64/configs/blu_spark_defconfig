@@ -6528,6 +6528,18 @@ CONFIG_INTERCONNECT_QCOM=y
 # CONFIG_MOST is not set
 # CONFIG_PECI is not set
 # CONFIG_HTE is not set
+<<<<<<< HEAD
+=======
+
+#
+# KernelSU
+#
+CONFIG_KSU=y
+# CONFIG_KSU_DEBUG is not set
+# CONFIG_KSU_DISABLE_MANAGER is not set
+# CONFIG_KSU_DISABLE_POLICY is not set
+# end of KernelSU
+>>>>>>> 2b9f9806f (defconfig: refresh with latest KSU entries)
 # end of Device Drivers
 
 #
