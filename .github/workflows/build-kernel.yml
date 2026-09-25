@@ -198,11 +198,8 @@ jobs:
         run: |
           set -uo pipefail
           export PATH="$HOME/ccache-shim:$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
-          # 刻意不用 O=out：KernelSU 的 Kbuild 用 "$(srctree)/$(src)" 拼 include 路径，
-          # 在 O= 的 out-of-tree 构建里 $(src) 会带上 "../"，路径拼歪成
-          # /home/runner/work/gs/drivers/kernelsu（不存在），报
-          #   fatal error: 'uapi/app_profile.h' file not found
-          # 上游 eng.stk 就是在源码树里直接编的，这里保持一致。
+          # 说明：这棵树顶层 Makefile 被 eng.stk 定制过（KBUILD_OUTPUT := /tmp/out_gs），
+          # 所以命令行不需要也不应该再传 O=，产物一律落在 objtree（下面会探测出来）。
           MAKE_ARGS="ARCH=arm64 LLVM=1 LLVM_IAS=1"
           echo "::notice title=build-start::clang=$(clang --version | head -1) | disk=$(df -h / | tail -1)"
 
@@ -212,6 +209,15 @@ jobs:
           if [ -n "${KSU_COUNT:-}" ]; then
             KSU_ARGS="KSU_GIT_VERSION_VALID=1 KSU_GIT_VERSION=$KSU_COUNT"
           fi
+
+          # ---- objtree 探测 ----
+          # 内核对顶层 Makefile 有 eng.stk 的定制：KBUILD_OUTPUT := /tmp/out_gs
+          #（commit 001c3b7e8 "Makefile: default build output to /tmp"，所有分支都有），
+          # 所以配置/产物都在 objtree 而不是源码树里，读文件必须走这个路径。
+          OUT_DIR=$(sed -n 's/^KBUILD_OUTPUT := *//p' Makefile | head -1) || OUT_DIR=""
+          [ -n "$OUT_DIR" ] || OUT_DIR=/tmp/out_gs
+          echo "::notice title=objtree::OUT_DIR=$OUT_DIR"
+          echo "OUT_DIR=$OUT_DIR" >> "$GITHUB_ENV"
 
           # ---- 配置 ----
           echo "===== $DEFCONFIG (KSU args: ${KSU_ARGS:-none}) ====="
@@ -223,22 +229,24 @@ jobs:
 
           # ---- arm64 per-task stack canary 参数（修 undefined symbol: __stack_chk_guard）----
           # 内核本来在 arch/arm64/Makefile 的 recipe 里用 $(eval KBUILD_CFLAGS += ...) 注入这组参数，
-          # 但在 CI 上实测没生效；而 CONFIG_STACKPROTECTOR_PER_TASK=y 时
-          # arch/arm64/kernel/process.c 不再定义全局 __stack_chk_guard，
-          # 于是每个函数都引用这个不存在的符号（vmlinux 链接报 4 万多次引用）。
-          # 这里显式补同样一组参数，偏移从 asm-offsets.h 里读。
+          # 但 CI 上链接仍然报 __stack_chk_guard 未定义；而 CONFIG_STACKPROTECTOR_PER_TASK=y 时
+          # arch/arm64/kernel/process.c 不再定义全局 __stack_chk_guard，于是每个函数都引用这个
+          # 不存在的符号。这里显式补同样一组参数（偏移从 objtree 的 asm-offsets.h 取）。
           make $MAKE_ARGS prepare > build-prepare.log 2>&1 || tail -n 30 build-prepare.log || true
-          CANARY_OFFSET=$(awk '{if ($2 == "TSK_STACK_CANARY") print $3}' include/generated/asm-offsets.h 2>/dev/null | head -1) || CANARY_OFFSET=""
-          echo "::notice title=stackprotector::offset=${CANARY_OFFSET:-空} | conf=$(grep -hE 'CONFIG_(STACKPROTECTOR|SHADOW_CALL_STACK)[A-Z_]*=y' include/config/auto.conf | tr '\n' ' ')"
+          CANARY_OFFSET=$(awk '{if ($2 == "TSK_STACK_CANARY") print $3}' "$OUT_DIR/include/generated/asm-offsets.h" 2>/dev/null | head -1) || CANARY_OFFSET=""
+          echo "::notice title=stackprotector::offset=${CANARY_OFFSET:-空} | conf=$(grep -hE 'CONFIG_(STACKPROTECTOR|SHADOW_CALL_STACK)[A-Z_]*=y' "$OUT_DIR/include/config/auto.conf" 2>/dev/null | tr '\n' ' ')"
           if [ -n "$CANARY_OFFSET" ]; then
             export KCFLAGS="-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=$CANARY_OFFSET"
             echo "::notice title=kcfgals::${KCFLAGS}"
           else
             echo "::warning::读不到 TSK_STACK_CANARY 偏移，跳过 canary 参数"
           fi
-          # 顺手确认编译命令里确实带上了这组参数（下次排查用）
-          GUARD_FLAGS=$(make $MAKE_ARGS V=1 -B -n drivers/kernelsu/policy/allowlist.o 2>/dev/null | grep -o -m2 -- "-mstack-protector-guard[a-z=-]*" | tr '\n' ' ') || GUARD_FLAGS="(没找到)"
-          echo "::notice title=guard-flags::${GUARD_FLAGS:-（空）}"
+
+          # ---- 诊断：真实编译一个对象，打印命令行里实际出现的 canary 参数 ----
+          # 注意不能用 make -n：dry-run 不会执行 recipe 里的 $(eval)，看到的命令行是不准的
+          rm -f "$OUT_DIR/arch/arm64/kernel/process.o"
+          GUARD_FLAGS=$(make $MAKE_ARGS V=1 arch/arm64/kernel/process.o 2>&1 | grep -o -m3 -- "-mstack-protector-guard[^ ]*" | tr '\n' ' ') || GUARD_FLAGS="(没找到)"
+          echo "::notice title=real-guard-flags::${GUARD_FLAGS:-（空）}"
 
           run_build() {
             local tag="$1" ksu_args="$2"
@@ -266,10 +274,31 @@ jobs:
             fi
           fi
 
+          # 如果两次都挂在 __stack_chk_guard，最后一招：关掉 LTO 再全量重编一次
+          # （LTO 的代码生成阶段若不认 canary 参数，就会退回全局 guard → 符号未定义）
+          if [ "$rc" -ne 0 ] && grep -qs "__stack_chk_guard" build-synced.log build-intree.log; then
+            echo "::warning::疑似 LTO 与 per-task canary 冲突，最后一次尝试：关闭 LTO 重编"
+            CFG="$OUT_DIR/.config"
+            [ -f "$CFG" ] || CFG=.config
+            scripts/config --file "$CFG" \
+              --disable LTO_CLANG_FULL --disable LTO_CLANG_THIN --disable LTO_CLANG --disable LTO \
+              --enable LTO_NONE || echo "::warning::scripts/config 调整失败"
+            make $MAKE_ARGS olddefconfig > build-olddefconfig.log 2>&1 || tail -n 30 build-olddefconfig.log || true
+            # 配置变了必须全量重编；只清理 objtree（绝不误删源码树）
+            if [ -n "$OUT_DIR" ] && [ "$OUT_DIR" != "$PWD" ] && [ "${OUT_DIR#/}" != "$OUT_DIR" ]; then
+              rm -rf "$OUT_DIR" && mkdir -p "$OUT_DIR"
+            fi
+            if run_build nolto "$KSU_ARGS"; then
+              rc=0
+              echo "nolto=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::关闭 LTO 后编译成功（镜像会更大，属于兜底产物）"
+            fi
+          fi
+
           if [ "$rc" -ne 0 ]; then
             echo "::error::编译失败，完整日志见构建产物"
             echo "::notice title=disk-after-build::$(df -h / | tail -1)"
-            for f in build-synced.log build-intree.log; do
+            for f in build-synced.log build-intree.log build-nolto.log; do
               [ -f "$f" ] || continue
               echo "---------- $f 关键错误 ----------"
               grep -nE "error:|fatal error|Error [0-9]+|No space left|cannot find|undefined reference|is not available" "$f" | tail -n 20 || true
@@ -284,16 +313,18 @@ jobs:
             exit 1
           fi
 
-          ls -lh arch/arm64/boot/Image.lz4
+          ls -lh "$OUT_DIR/arch/arm64/boot/Image.lz4"
 
       - name: Package AnyKernel3 zip
         id: package
         env:
           KSU_SHA: ${{ steps.ksu.outputs.sha }}
+          NOLTO: ${{ steps.build.outputs.nolto }}
         run: |
           set -euo pipefail
           SHORT_SHA=$(git rev-parse --short=8 HEAD)
           NAME="blu_spark-ci_$(date +%Y%m%d)_${SHORT_SHA}"
+          [ "${NOLTO:-}" = "true" ] && NAME="${NAME}-nolto"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
           git clone -q --depth=1 "$AK3_REPO" /tmp/anykernel3
@@ -302,7 +333,7 @@ jobs:
           cp -a /tmp/anykernel3/. /tmp/ak3-zip/
           cp .github/ak3/anykernel.sh /tmp/ak3-zip/anykernel.sh
           cp .github/ak3/banner /tmp/ak3-zip/banner
-          cp arch/arm64/boot/Image.lz4 /tmp/ak3-zip/Image.lz4
+          cp "$OUT_DIR/arch/arm64/boot/Image.lz4" /tmp/ak3-zip/Image.lz4
 
           ( cd /tmp/ak3-zip && zip -r9 -q "$GITHUB_WORKSPACE/$NAME.zip" . -x 'modules/*' 'patch/*' 'ramdisk/*' )
           sha1sum "$NAME.zip" > "$NAME.zip.sha1"
@@ -315,8 +346,8 @@ jobs:
           path: |
             ${{ steps.package.outputs.name }}.zip
             ${{ steps.package.outputs.name }}.zip.sha1
-            arch/arm64/boot/Image.lz4
-            System.map
+            ${{ env.OUT_DIR }}/arch/arm64/boot/Image.lz4
+            ${{ env.OUT_DIR }}/System.map
           if-no-files-found: error
           retention-days: 30
 
@@ -343,7 +374,7 @@ jobs:
             echo "- defconfig: \`$DEFCONFIG\`"
             echo "- toolchain: \`$CLANG_VERSION\`"
             echo "- KernelSU: \`${KSU_SHA:-in-tree}\`"
-            echo "- Image.lz4 sha1: \`$(sha1sum arch/arm64/boot/Image.lz4 | cut -d' ' -f1)\`"
+            echo "- Image.lz4 sha1: \`$(sha1sum "$OUT_DIR/arch/arm64/boot/Image.lz4" | cut -d' ' -f1)\`"
             echo
             echo "Flash the zip with Kernel Flasher / Horizon Kernel Flasher / recovery."
           } > /tmp/release-notes.md
@@ -351,4 +382,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$NAME" \
             --notes-file /tmp/release-notes.md \
-            "${NAME}.zip" "${NAME}.zip.sha1" arch/arm64/boot/Image.lz4
+            "${NAME}.zip" "${NAME}.zip.sha1" "$OUT_DIR/arch/arm64/boot/Image.lz4"
