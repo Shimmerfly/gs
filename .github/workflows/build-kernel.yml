@@ -189,7 +189,12 @@ jobs:
         run: |
           set -uo pipefail
           export PATH="$HOME/ccache-shim:$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
-          MAKE_ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1"
+          # 刻意不用 O=out：KernelSU 的 Kbuild 用 "$(srctree)/$(src)" 拼 include 路径，
+          # 在 O= 的 out-of-tree 构建里 $(src) 会带上 "../"，路径拼歪成
+          # /home/runner/work/gs/drivers/kernelsu（不存在），报
+          #   fatal error: 'uapi/app_profile.h' file not found
+          # 上游 eng.stk 就是在源码树里直接编的，这里保持一致。
+          MAKE_ARGS="ARCH=arm64 LLVM=1 LLVM_IAS=1"
           echo "::notice title=build-start::clang=$(clang --version | head -1) | disk=$(df -h / | tail -1)"
 
           # eng.stk 在仓库内 Kbuild 里写死了版本号；同步上游后要让 Kbuild
@@ -200,20 +205,24 @@ jobs:
           fi
 
           run_build() {
-            local tag="$1" ksu_args="$2"
-            rm -rf out
+            local tag="$1" ksu_args="$2" do_config="$3"
             # 子 shell + tee：编译过程实时显示在 Actions 日志里，同时完整落盘到 build-$tag.log
-            # (用子 shell 是为了 defconfig 失败时只退出子 shell，外层还能做回退重编)
+            # (用子 shell 是为了配置阶段失败时只退出子 shell，外层还能做回退重编)
             (
-              echo "===== $DEFCONFIG (KSU args: ${ksu_args:-none}) ====="
-              make $MAKE_ARGS $ksu_args "$DEFCONFIG" 2>&1 | tee "build-$tag.log" || exit 1
+              if [ "$do_config" = "yes" ] || [ ! -f .config ]; then
+                echo "===== $DEFCONFIG (KSU args: ${ksu_args:-none}) ====="
+                make $MAKE_ARGS $ksu_args "$DEFCONFIG" 2>&1 | tee "build-$tag.log" || exit 1
+              else
+                # 回退重编时沿用已配置好的 .config，只重编被换掉的 KSU 代码
+                : > "build-$tag.log"
+              fi
               echo "===== Image.lz4 =====" | tee -a "build-$tag.log"
               make -j"$(nproc)" $MAKE_ARGS $ksu_args Image.lz4 2>&1 | tee -a "build-$tag.log"
             )
           }
 
           rc=0
-          run_build synced "$KSU_ARGS" || rc=$?
+          run_build synced "$KSU_ARGS" yes || rc=$?
 
           if [ "$rc" -ne 0 ] && [ "${KSU_SYNCED:-}" = "true" ]; then
             echo "::warning::上游 KernelSU 编译失败，回退到仓库内自带 KSU 版本重编"
@@ -222,7 +231,7 @@ jobs:
             echo "----------------------------------"
             git checkout -- drivers/kernelsu || echo "::warning::恢复仓库内 drivers/kernelsu 失败"
             git clean -qfd drivers/kernelsu || true
-            if run_build intree ""; then
+            if run_build intree "" no; then
               rc=0
               echo "fallback=true" >> "$GITHUB_OUTPUT"
               echo "::notice::回退版本编译成功"
@@ -247,7 +256,7 @@ jobs:
             exit 1
           fi
 
-          ls -lh out/arch/arm64/boot/Image.lz4
+          ls -lh arch/arm64/boot/Image.lz4
 
       - name: Package AnyKernel3 zip
         id: package
@@ -265,7 +274,7 @@ jobs:
           cp -a /tmp/anykernel3/. /tmp/ak3-zip/
           cp .github/ak3/anykernel.sh /tmp/ak3-zip/anykernel.sh
           cp .github/ak3/banner /tmp/ak3-zip/banner
-          cp out/arch/arm64/boot/Image.lz4 /tmp/ak3-zip/Image.lz4
+          cp arch/arm64/boot/Image.lz4 /tmp/ak3-zip/Image.lz4
 
           ( cd /tmp/ak3-zip && zip -r9 -q "$GITHUB_WORKSPACE/$NAME.zip" . -x 'modules/*' 'patch/*' 'ramdisk/*' )
           sha1sum "$NAME.zip" > "$NAME.zip.sha1"
@@ -278,8 +287,8 @@ jobs:
           path: |
             ${{ steps.package.outputs.name }}.zip
             ${{ steps.package.outputs.name }}.zip.sha1
-            out/arch/arm64/boot/Image.lz4
-            out/System.map
+            arch/arm64/boot/Image.lz4
+            System.map
           if-no-files-found: error
           retention-days: 30
 
@@ -306,7 +315,7 @@ jobs:
             echo "- defconfig: \`$DEFCONFIG\`"
             echo "- toolchain: \`$CLANG_VERSION\`"
             echo "- KernelSU: \`${KSU_SHA:-in-tree}\`"
-            echo "- Image.lz4 sha1: \`$(sha1sum out/arch/arm64/boot/Image.lz4 | cut -d' ' -f1)\`"
+            echo "- Image.lz4 sha1: \`$(sha1sum arch/arm64/boot/Image.lz4 | cut -d' ' -f1)\`"
             echo
             echo "Flash the zip with Kernel Flasher / Horizon Kernel Flasher / recovery."
           } > /tmp/release-notes.md
@@ -314,4 +323,4 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$NAME" \
             --notes-file /tmp/release-notes.md \
-            "${NAME}.zip" "${NAME}.zip.sha1" out/arch/arm64/boot/Image.lz4
+            "${NAME}.zip" "${NAME}.zip.sha1" arch/arm64/boot/Image.lz4
