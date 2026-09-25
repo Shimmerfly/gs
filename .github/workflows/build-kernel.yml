@@ -177,7 +177,16 @@ jobs:
 
           rm -rf drivers/kernelsu
           mkdir -p drivers/kernelsu
-          cp -a /tmp/KernelSU/kernel/. drivers/kernelsu/
+          # 必须 -L 跟随软链：上游 kernel/include/uapi 是指向仓库根 uapi/ 的符号链接
+          #（git mode 120000），用 cp -a 会照抄成断链，于是 policy/allowlist.h 的
+          #   #include "uapi/app_profile.h"
+          # 找不到文件，报 fatal error: 'uapi/app_profile.h' file not found。
+          cp -rL /tmp/KernelSU/kernel/. drivers/kernelsu/
+          if [ -f drivers/kernelsu/include/uapi/app_profile.h ]; then
+            echo "::notice title=ksu-headers::include/uapi/app_profile.h 就位"
+          else
+            echo "::error title=ksu-headers::include/uapi/app_profile.h 缺失，软链没跟对"
+          fi
           echo "--- 与仓库内版本的差异（前 20 项）---"
           git status --short drivers/kernelsu | head -20 || true
 
@@ -204,25 +213,44 @@ jobs:
             KSU_ARGS="KSU_GIT_VERSION_VALID=1 KSU_GIT_VERSION=$KSU_COUNT"
           fi
 
+          # ---- 配置 ----
+          echo "===== $DEFCONFIG (KSU args: ${KSU_ARGS:-none}) ====="
+          if ! make $MAKE_ARGS $KSU_ARGS "$DEFCONFIG" 2>&1 | tee build-config.log; then
+            echo "::error::defconfig 失败"
+            tail -n 60 build-config.log || true
+            exit 1
+          fi
+
+          # ---- arm64 per-task stack canary 参数（修 undefined symbol: __stack_chk_guard）----
+          # 内核本来在 arch/arm64/Makefile 的 recipe 里用 $(eval KBUILD_CFLAGS += ...) 注入这组参数，
+          # 但在 CI 上实测没生效；而 CONFIG_STACKPROTECTOR_PER_TASK=y 时
+          # arch/arm64/kernel/process.c 不再定义全局 __stack_chk_guard，
+          # 于是每个函数都引用这个不存在的符号（vmlinux 链接报 4 万多次引用）。
+          # 这里显式补同样一组参数，偏移从 asm-offsets.h 里读。
+          make $MAKE_ARGS prepare > build-prepare.log 2>&1 || tail -n 30 build-prepare.log || true
+          CANARY_OFFSET=$(awk '{if ($2 == "TSK_STACK_CANARY") print $3}' include/generated/asm-offsets.h 2>/dev/null | head -1) || CANARY_OFFSET=""
+          echo "::notice title=stackprotector::offset=${CANARY_OFFSET:-空} | conf=$(grep -hE 'CONFIG_(STACKPROTECTOR|SHADOW_CALL_STACK)[A-Z_]*=y' include/config/auto.conf | tr '\n' ' ')"
+          if [ -n "$CANARY_OFFSET" ]; then
+            export KCFLAGS="-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=$CANARY_OFFSET"
+            echo "::notice title=kcfgals::${KCFLAGS}"
+          else
+            echo "::warning::读不到 TSK_STACK_CANARY 偏移，跳过 canary 参数"
+          fi
+          # 顺手确认编译命令里确实带上了这组参数（下次排查用）
+          GUARD_FLAGS=$(make $MAKE_ARGS V=1 -B -n drivers/kernelsu/policy/allowlist.o 2>/dev/null | grep -o -m2 -- "-mstack-protector-guard[a-z=-]*" | tr '\n' ' ') || GUARD_FLAGS="(没找到)"
+          echo "::notice title=guard-flags::${GUARD_FLAGS:-（空）}"
+
           run_build() {
-            local tag="$1" ksu_args="$2" do_config="$3"
+            local tag="$1" ksu_args="$2"
             # 子 shell + tee：编译过程实时显示在 Actions 日志里，同时完整落盘到 build-$tag.log
-            # (用子 shell 是为了配置阶段失败时只退出子 shell，外层还能做回退重编)
             (
-              if [ "$do_config" = "yes" ] || [ ! -f .config ]; then
-                echo "===== $DEFCONFIG (KSU args: ${ksu_args:-none}) ====="
-                make $MAKE_ARGS $ksu_args "$DEFCONFIG" 2>&1 | tee "build-$tag.log" || exit 1
-              else
-                # 回退重编时沿用已配置好的 .config，只重编被换掉的 KSU 代码
-                : > "build-$tag.log"
-              fi
-              echo "===== Image.lz4 =====" | tee -a "build-$tag.log"
-              make -j"$(nproc)" $MAKE_ARGS $ksu_args Image.lz4 2>&1 | tee -a "build-$tag.log"
+              echo "===== Image.lz4 (KSU args: ${ksu_args:-none}) ====="
+              make -j"$(nproc)" $MAKE_ARGS $ksu_args Image.lz4 2>&1 | tee "build-$tag.log"
             )
           }
 
           rc=0
-          run_build synced "$KSU_ARGS" yes || rc=$?
+          run_build synced "$KSU_ARGS" || rc=$?
 
           if [ "$rc" -ne 0 ] && [ "${KSU_SYNCED:-}" = "true" ]; then
             echo "::warning::上游 KernelSU 编译失败，回退到仓库内自带 KSU 版本重编"
@@ -231,7 +259,7 @@ jobs:
             echo "----------------------------------"
             git checkout -- drivers/kernelsu || echo "::warning::恢复仓库内 drivers/kernelsu 失败"
             git clean -qfd drivers/kernelsu || true
-            if run_build intree "" no; then
+            if run_build intree ""; then
               rc=0
               echo "fallback=true" >> "$GITHUB_OUTPUT"
               echo "::notice::回退版本编译成功"
