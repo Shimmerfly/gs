@@ -1,0 +1,284 @@
+# ---------------------------------------------------------------------------
+# blu_spark-16-los 内核 CI
+#
+#   目标分支   : blu_spark-16-los (Linux 6.1.x / LineageOS 23.2 = Android 16)
+#   目标设备   : Pixel 6/7/8/9 系列 (gs, Tensor G1~G4)
+#   工具链     : AOSP prebuilt clang-r487747c (build.config.constants 里指定的版本)
+#   KernelSU   : 默认每次构建都从 tiann/KernelSU 拉最新 main 覆盖 drivers/kernelsu；
+#                同步后的 KSU 如果编不过，会自动回退到仓库内自带版本再编一次
+#   产物       : AnyKernel3 刷机 zip + Image.lz4 + System.map
+#
+#   注意: 本仓库里 drivers/kernelsu 是 eng.stk 打过补丁的副本
+#         (Kbuild 里写死 KSU_GIT_VERSION、apk_sign.c 里多一个 manager 签名)，
+#         同步上游时这两处会丢失 —— 版本号在下面的构建步骤里用
+#         KSU_GIT_VERSION_VALID/KSU_GIT_VERSION 从命令行补回来了。
+# ---------------------------------------------------------------------------
+name: Build Kernel (blu_spark-16-los)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "KernelSU ref (分支/标签/commit)，留空用 main"
+        required: false
+        default: "main"
+      sync_ksu:
+        description: "是否同步 tiann/KernelSU 最新代码"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      release:
+        description: "构建成功后创建 GitHub Release"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+  push:
+    branches:
+      - blu_spark-16-los
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  DEFCONFIG: blu_spark_defconfig
+  CLANG_BRANCH: android-gs-bluejay-6.1-android16
+  CLANG_VERSION: clang-r487747c
+  CLANG_DIR: /home/runner/clang-aosp
+  KSU_REPO: https://github.com/tiann/KernelSU
+  AK3_REPO: https://github.com/osm0sis/AnyKernel3
+
+jobs:
+  build:
+    name: Build kernel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler file flex git \
+            kmod libelf-dev libssl-dev lz4 python3 python-is-python3 rsync unzip xz-utils \
+            zip zstd
+          # clang-r487747c 是较老的预编译包，某些镜像上还需要 libtinfo5
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libtinfo5 2>/dev/null || true
+
+      - name: Cache AOSP clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLANG_DIR }}
+          key: clang-${{ env.CLANG_BRANCH }}-${{ env.CLANG_VERSION }}-v1
+
+      - name: Fetch AOSP clang (${{ env.CLANG_VERSION }})
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          rm -rf "$CLANG_DIR"
+          # 只稀疏检出需要的那一个 clang，避免拉下整个 prebuilts 仓库
+          git clone --filter=blob:none --no-checkout --depth=1 -b "$CLANG_BRANCH" \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR"
+          cd "$CLANG_DIR"
+          git sparse-checkout init --cone
+          git sparse-checkout set "$CLANG_VERSION"
+          git checkout
+
+      - name: Verify clang
+        run: |
+          set -euo pipefail
+          export PATH="$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
+          echo "$CLANG_DIR/$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+          if ! clang --version; then
+            echo "::warning::clang 启动失败，尝试补一个 libtinfo.so.5 兼容链接"
+            for lib in /lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.6; do
+              if [ -e "$lib" ]; then
+                sudo ln -sf "$lib" /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+              fi
+            done
+            sudo ldconfig
+            clang --version
+          fi
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref_name }}-
+
+      - name: Setup ccache
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/ccache-shim"
+          for tool in clang clang++; do
+            ln -sf "$(command -v ccache)" "$HOME/ccache-shim/$tool"
+          done
+          ccache --max-size=5G
+          ccache -z
+          ccache --version | head -1
+
+      - name: Sync KernelSU from upstream
+        id: ksu
+        if: github.event_name != 'workflow_dispatch' || inputs.sync_ksu == 'true'
+        env:
+          KSU_REF: ${{ inputs.ksu_ref || 'main' }}
+        run: |
+          set -uo pipefail
+
+          fail_sync() {
+            echo "::warning::$1，改用仓库内自带 KernelSU 版本"
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # blob:none 的完整历史克隆：既能算出版本号(KSU_VERSION = 30000 + commit count)，
+          # 又不用把全部 blob 拉下来。注意千万不能加 --depth=1，否则历史被截断、count 变成 1
+          git clone -q --filter=blob:none --no-checkout "$KSU_REPO" /tmp/KernelSU \
+            || fail_sync "克隆 KernelSU 失败"
+          git -C /tmp/KernelSU fetch -q origin "$KSU_REF" || true
+          git -C /tmp/KernelSU checkout -q --detach FETCH_HEAD 2>/dev/null \
+            || git -C /tmp/KernelSU checkout -q --detach "$KSU_REF" \
+            || fail_sync "检出 KernelSU ref=$KSU_REF 失败"
+
+          KSU_COUNT=$(git -C /tmp/KernelSU rev-list --count HEAD)
+          KSU_SHA=$(git -C /tmp/KernelSU rev-parse --short=12 HEAD)
+          [ -n "$KSU_COUNT" ] && [ -n "$KSU_SHA" ] || fail_sync "读取 KernelSU 版本信息失败"
+
+          echo "count=$KSU_COUNT" >> "$GITHUB_OUTPUT"
+          echo "sha=$KSU_SHA" >> "$GITHUB_OUTPUT"
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+          echo "KernelSU $KSU_REF @ $KSU_SHA (commit count $KSU_COUNT => KSU_VERSION $((30000 + KSU_COUNT)))"
+
+          rm -rf drivers/kernelsu
+          mkdir -p drivers/kernelsu
+          cp -a /tmp/KernelSU/kernel/. drivers/kernelsu/
+          echo "--- 与仓库内版本的差异（前 20 项）---"
+          git status --short drivers/kernelsu | head -20 || true
+
+      - name: Build kernel
+        id: build
+        env:
+          KSU_COUNT: ${{ steps.ksu.outputs.count }}
+          KSU_SYNCED: ${{ steps.ksu.outputs.synced }}
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/ccache-shim:$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
+          MAKE_ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1"
+
+          # eng.stk 在仓库内 Kbuild 里写死了版本号；同步上游后要让 Kbuild
+          # 仍然算出 30000 + commit count 的版本，就从命令行喂给它
+          KSU_ARGS=""
+          if [ -n "${KSU_COUNT:-}" ]; then
+            KSU_ARGS="KSU_GIT_VERSION_VALID=1 KSU_GIT_VERSION=$KSU_COUNT"
+          fi
+
+          run_build() {
+            local tag="$1" ksu_args="$2"
+            rm -rf out
+            # 用子 shell 包住，defconfig 失败时只让子 shell 退出，方便外层做回退重编
+            (
+              echo "===== $DEFCONFIG (KSU args: ${ksu_args:-none}) ====="
+              make $MAKE_ARGS $ksu_args "$DEFCONFIG" || exit 1
+              echo "===== Image.lz4 ====="
+              make -j"$(nproc)" $MAKE_ARGS $ksu_args Image.lz4
+            ) > "build-$tag.log" 2>&1
+          }
+
+          rc=0
+          run_build synced "$KSU_ARGS" || rc=$?
+
+          if [ "$rc" -ne 0 ] && [ "${KSU_SYNCED:-}" = "true" ]; then
+            echo "::warning::上游 KernelSU 编译失败，回退到仓库内自带 KSU 版本重编"
+            echo "---------- 失败日志尾部 ----------"
+            tail -n 60 build-synced.log || true
+            echo "----------------------------------"
+            git checkout -- drivers/kernelsu
+            git clean -qfd drivers/kernelsu
+            if run_build intree ""; then
+              rc=0
+              echo "fallback=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::回退版本编译成功"
+            fi
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::编译失败，完整日志见构建产物"
+            tail -n 120 build-synced.log || true
+            tail -n 120 build-intree.log 2>/dev/null || true
+            exit 1
+          fi
+
+          ls -lh out/arch/arm64/boot/Image.lz4
+
+      - name: Package AnyKernel3 zip
+        id: package
+        env:
+          KSU_SHA: ${{ steps.ksu.outputs.sha }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          NAME="blu_spark-ci_$(date +%Y%m%d)_${SHORT_SHA}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+          git clone -q --depth=1 "$AK3_REPO" /tmp/anykernel3
+          rm -rf /tmp/anykernel3/.git /tmp/anykernel3/README.md /tmp/anykernel3/anykernel.sh
+          mkdir -p /tmp/ak3-zip
+          cp -a /tmp/anykernel3/. /tmp/ak3-zip/
+          cp .github/ak3/anykernel.sh /tmp/ak3-zip/anykernel.sh
+          cp .github/ak3/banner /tmp/ak3-zip/banner
+          cp out/arch/arm64/boot/Image.lz4 /tmp/ak3-zip/Image.lz4
+
+          ( cd /tmp/ak3-zip && zip -r9 -q "$GITHUB_WORKSPACE/$NAME.zip" . -x 'modules/*' 'patch/*' 'ramdisk/*' )
+          sha1sum "$NAME.zip" > "$NAME.zip.sha1"
+          unzip -l "$NAME.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.name }}.zip
+            ${{ steps.package.outputs.name }}.zip.sha1
+            out/arch/arm64/boot/Image.lz4
+            out/System.map
+            build-*.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KSU_SHA: ${{ steps.ksu.outputs.sha }}
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.package.outputs.name }}"
+          {
+            echo "Automatic CI build of \`blu_spark-16-los\` ($(git rev-parse --short=12 HEAD))"
+            echo
+            echo "- defconfig: \`$DEFCONFIG\`"
+            echo "- toolchain: \`$CLANG_VERSION\`"
+            echo "- KernelSU: \`${KSU_SHA:-in-tree}\`"
+            echo "- Image.lz4 sha1: \`$(sha1sum out/arch/arm64/boot/Image.lz4 | cut -d' ' -f1)\`"
+            echo
+            echo "Flash the zip with Kernel Flasher / Horizon Kernel Flasher / recovery."
+          } > /tmp/release-notes.md
+          gh release create "$NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$NAME" \
+            --notes-file /tmp/release-notes.md \
+            "${NAME}.zip" "${NAME}.zip.sha1" out/arch/arm64/boot/Image.lz4
