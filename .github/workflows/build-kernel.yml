@@ -189,13 +189,14 @@ jobs:
           run_build() {
             local tag="$1" ksu_args="$2"
             rm -rf out
-            # 用子 shell 包住，defconfig 失败时只让子 shell 退出，方便外层做回退重编
+            # 子 shell + tee：编译过程实时显示在 Actions 日志里，同时完整落盘到 build-$tag.log
+            # (用子 shell 是为了 defconfig 失败时只退出子 shell，外层还能做回退重编)
             (
               echo "===== $DEFCONFIG (KSU args: ${ksu_args:-none}) ====="
-              make $MAKE_ARGS $ksu_args "$DEFCONFIG" || exit 1
-              echo "===== Image.lz4 ====="
-              make -j"$(nproc)" $MAKE_ARGS $ksu_args Image.lz4
-            ) > "build-$tag.log" 2>&1
+              make $MAKE_ARGS $ksu_args "$DEFCONFIG" 2>&1 | tee "build-$tag.log" || exit 1
+              echo "===== Image.lz4 =====" | tee -a "build-$tag.log"
+              make -j"$(nproc)" $MAKE_ARGS $ksu_args Image.lz4 2>&1 | tee -a "build-$tag.log"
+            )
           }
 
           rc=0
@@ -206,8 +207,8 @@ jobs:
             echo "---------- 失败日志尾部 ----------"
             tail -n 60 build-synced.log || true
             echo "----------------------------------"
-            git checkout -- drivers/kernelsu
-            git clean -qfd drivers/kernelsu
+            git checkout -- drivers/kernelsu || echo "::warning::恢复仓库内 drivers/kernelsu 失败"
+            git clean -qfd drivers/kernelsu || true
             if run_build intree ""; then
               rc=0
               echo "fallback=true" >> "$GITHUB_OUTPUT"
@@ -255,8 +256,16 @@ jobs:
             ${{ steps.package.outputs.name }}.zip.sha1
             out/arch/arm64/boot/Image.lz4
             out/System.map
-            build-*.log
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build-*.log
+          if-no-files-found: ignore
           retention-days: 30
 
       - name: Create GitHub Release
