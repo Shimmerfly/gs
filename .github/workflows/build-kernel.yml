@@ -236,17 +236,27 @@ jobs:
           CANARY_OFFSET=$(awk '{if ($2 == "TSK_STACK_CANARY") print $3}' "$OUT_DIR/include/generated/asm-offsets.h" 2>/dev/null | head -1) || CANARY_OFFSET=""
           echo "::notice title=stackprotector::offset=${CANARY_OFFSET:-空} | conf=$(grep -hE 'CONFIG_(STACKPROTECTOR|SHADOW_CALL_STACK)[A-Z_]*=y' "$OUT_DIR/include/config/auto.conf" 2>/dev/null | tr '\n' ' ')"
           if [ -n "$CANARY_OFFSET" ]; then
-            export KCFLAGS="-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=$CANARY_OFFSET"
-            echo "::notice title=kcfgals::${KCFLAGS}"
+            CANARY_FLAGS="-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=$CANARY_OFFSET"
+            export KCFLAGS="$CANARY_FLAGS"
+            echo "::notice title=kcfgals::${CANARY_FLAGS}"
+            # 只靠环境变量 KCFLAGS 实测没进编译命令，这里直接追加到树里的 Makefile（makefile 赋值必定生效）
+            printf '\n# appended by CI: arm64 per-task stack canary\nKBUILD_CFLAGS += %s\n' "$CANARY_FLAGS" >> Makefile
+            echo "::notice title=makefile-append::$(tail -n 1 Makefile)"
           else
             echo "::warning::读不到 TSK_STACK_CANARY 偏移，跳过 canary 参数"
           fi
 
-          # ---- 诊断：真实编译一个对象，打印命令行里实际出现的 canary 参数 ----
+          # ---- 诊断 A：prepare 之后 KBUILD_CFLAGS 里到底有没有这组参数 ----
+          make $MAKE_ARGS --eval='kcflags-check: prepare ; @echo "VERIFY_KCFLAGS: $(KBUILD_CFLAGS)"' kcflags-check \
+            > build-verify.log 2>&1 || true
+          echo "::notice title=verify-cflags::$(grep -o -m3 -- '-mstack-protector-guard[^ ]*' build-verify.log | tr '\n' ' ')"
+
+          # ---- 诊断 B：真实编译一个对象，打印命令行里实际出现的 canary 参数 ----
           # 注意不能用 make -n：dry-run 不会执行 recipe 里的 $(eval)，看到的命令行是不准的
           rm -f "$OUT_DIR/arch/arm64/kernel/process.o"
-          GUARD_FLAGS=$(make $MAKE_ARGS V=1 arch/arm64/kernel/process.o 2>&1 | grep -o -m3 -- "-mstack-protector-guard[^ ]*" | tr '\n' ' ') || GUARD_FLAGS="(没找到)"
-          echo "::notice title=real-guard-flags::${GUARD_FLAGS:-（空）}"
+          make $MAKE_ARGS V=1 arch/arm64/kernel/process.o > build-oneobj.log 2>&1 || true
+          echo "::notice title=real-guard-flags::$(grep -o -m3 -- '-mstack-protector-guard[^ ]*' build-oneobj.log | tr '\n' ' ')"
+          echo "::notice title=oneobj-tail::$(tail -n 2 build-oneobj.log | tr '\n' '|' | cut -c1-300)"
 
           run_build() {
             local tag="$1" ksu_args="$2"
@@ -274,31 +284,32 @@ jobs:
             fi
           fi
 
-          # 如果两次都挂在 __stack_chk_guard，最后一招：关掉 LTO 再全量重编一次
-          # （LTO 的代码生成阶段若不认 canary 参数，就会退回全局 guard → 符号未定义）
+          # 如果两次都挂在 __stack_chk_guard，最后一招：关掉 stack protector 再全量重编
+          # （STACKPROTECTOR 是可选项，关了之后编译连 canary 都不会引用，必定能链接；
+          #  代价是没有栈保护 + 没有 shadow call stack，产物名会带 -nossp 便于区分）
           if [ "$rc" -ne 0 ] && grep -qs "__stack_chk_guard" build-synced.log build-intree.log; then
-            echo "::warning::疑似 LTO 与 per-task canary 冲突，最后一次尝试：关闭 LTO 重编"
+            echo "::warning::canary 参数仍未生效，最后一次尝试：关闭 stack protector / shadow call stack 重编"
             CFG="$OUT_DIR/.config"
             [ -f "$CFG" ] || CFG=.config
             scripts/config --file "$CFG" \
-              --disable LTO_CLANG_FULL --disable LTO_CLANG_THIN --disable LTO_CLANG --disable LTO \
-              --enable LTO_NONE || echo "::warning::scripts/config 调整失败"
+              --disable STACKPROTECTOR_STRONG --disable STACKPROTECTOR --disable SHADOW_CALL_STACK \
+              || echo "::warning::scripts/config 调整失败"
             make $MAKE_ARGS olddefconfig > build-olddefconfig.log 2>&1 || tail -n 30 build-olddefconfig.log || true
             # 配置变了必须全量重编；只清理 objtree（绝不误删源码树）
             if [ -n "$OUT_DIR" ] && [ "$OUT_DIR" != "$PWD" ] && [ "${OUT_DIR#/}" != "$OUT_DIR" ]; then
               rm -rf "$OUT_DIR" && mkdir -p "$OUT_DIR"
             fi
-            if run_build nolto "$KSU_ARGS"; then
+            if run_build nossp "$KSU_ARGS"; then
               rc=0
-              echo "nolto=true" >> "$GITHUB_OUTPUT"
-              echo "::notice::关闭 LTO 后编译成功（镜像会更大，属于兜底产物）"
+              echo "nossp=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::关闭 stack protector 后编译成功（无栈保护的兜底产物）"
             fi
           fi
 
           if [ "$rc" -ne 0 ]; then
             echo "::error::编译失败，完整日志见构建产物"
             echo "::notice title=disk-after-build::$(df -h / | tail -1)"
-            for f in build-synced.log build-intree.log build-nolto.log; do
+            for f in build-synced.log build-intree.log build-nossp.log; do
               [ -f "$f" ] || continue
               echo "---------- $f 关键错误 ----------"
               grep -nE "error:|fatal error|Error [0-9]+|No space left|cannot find|undefined reference|is not available" "$f" | tail -n 20 || true
@@ -319,12 +330,12 @@ jobs:
         id: package
         env:
           KSU_SHA: ${{ steps.ksu.outputs.sha }}
-          NOLTO: ${{ steps.build.outputs.nolto }}
+          NOSSP: ${{ steps.build.outputs.nossp }}
         run: |
           set -euo pipefail
           SHORT_SHA=$(git rev-parse --short=8 HEAD)
           NAME="blu_spark-ci_$(date +%Y%m%d)_${SHORT_SHA}"
-          [ "${NOLTO:-}" = "true" ] && NAME="${NAME}-nolto"
+          [ "${NOSSP:-}" = "true" ] && NAME="${NAME}-nossp"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
           git clone -q --depth=1 "$AK3_REPO" /tmp/anykernel3
