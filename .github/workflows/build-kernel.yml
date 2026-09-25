@@ -76,6 +76,18 @@ jobs:
           # clang-r487747c 是较老的预编译包，某些镜像上还需要 libtinfo5
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libtinfo5 2>/dev/null || true
 
+      - name: Free up disk space
+        run: |
+          set -euo pipefail
+          echo "::notice title=disk-before::$(df -h / | tail -1)"
+          # GitHub runner 的系统盘只有 ~14G，内核 LTO 构建很容易撑爆，
+          # 先把预装的一堆用不上的 SDK 清掉（官方 runner 常用的瘦身手法）
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/local/graalvm /usr/local/.ghcup 2>/dev/null || true
+          sudo apt-get clean
+          echo "::notice title=disk-after::$(df -h / | tail -1)"
+
       - name: Cache AOSP clang
         id: clang-cache
         uses: actions/cache@v4
@@ -127,7 +139,7 @@ jobs:
           for tool in clang clang++; do
             ln -sf "$(command -v ccache)" "$HOME/ccache-shim/$tool"
           done
-          ccache --max-size=5G
+          ccache --max-size=3G
           ccache -z
           ccache --version | head -1
 
@@ -178,6 +190,7 @@ jobs:
           set -uo pipefail
           export PATH="$HOME/ccache-shim:$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
           MAKE_ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1"
+          echo "::notice title=build-start::clang=$(clang --version | head -1) | disk=$(df -h / | tail -1)"
 
           # eng.stk 在仓库内 Kbuild 里写死了版本号；同步上游后要让 Kbuild
           # 仍然算出 30000 + commit count 的版本，就从命令行喂给它
@@ -218,8 +231,19 @@ jobs:
 
           if [ "$rc" -ne 0 ]; then
             echo "::error::编译失败，完整日志见构建产物"
-            tail -n 120 build-synced.log || true
-            tail -n 120 build-intree.log 2>/dev/null || true
+            echo "::notice title=disk-after-build::$(df -h / | tail -1)"
+            for f in build-synced.log build-intree.log; do
+              [ -f "$f" ] || continue
+              echo "---------- $f 关键错误 ----------"
+              grep -nE "error:|fatal error|Error [0-9]+|No space left|cannot find|undefined reference|is not available" "$f" | tail -n 20 || true
+              echo "---------- $f 末尾 40 行 ----------"
+              tail -n 40 "$f" || true
+              # 把关键错误发成 annotation：这样没有仓库权限也能通过 check-run API 读到
+              grep -m3 -E "error:|fatal error|No space left on device|Error [0-9]+" "$f" 2>/dev/null | head -3 | while IFS= read -r line; do
+                safe=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r//g' | cut -c1-400)
+                echo "::error title=${f}::${safe}"
+              done || true
+            done
             exit 1
           fi
 
