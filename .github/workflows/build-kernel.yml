@@ -460,7 +460,7 @@ jobs:
           # 所以直接拿 engstk 官方 release 的 AK3 包当基底（他的 tools/META-INF 是 aarch64），
           # 只把 Image.lz4 和 anykernel.sh 换成我们编出来的。
           BASE_URL=$(curl -fsSL "https://api.github.com/repos/engstk/gs/releases/latest" \
-            | python3 -c "import json,sys;d=json.load(sys.stdin);a=[x['browser_download_url'] for x in d.get('assets',[]) if x['name'].endswith('.zip')];print(a[0] if a else '')")
+            | python3 -c "import json,sys;d=json.load(sys.stdin);z=[x['browser_download_url'] for x in d.get('assets',[]) if x['name'].endswith('.zip')];p=[u for u in z if '-los' in u] or [u for u in z if '-susfs' not in u and '-next' not in u] or z;print(p[0] if p else '')")
           if [ -z "$BASE_URL" ]; then
             echo "::error::拿不到 engstk 官方 AK3 包地址（网络问题或 release 结构变化）"
             exit 1
@@ -484,6 +484,17 @@ jobs:
           ( cd /tmp/ak3-zip && zip -r9 -q "$GITHUB_WORKSPACE/$NAME.zip" . \
               -x 'modules/*' 'patch/*' 'ramdisk/*' '.github/*' '.gitignore' )
           sha1sum "$NAME.zip" > "$NAME.zip.sha1"
+          cat > README-如何刷机.txt <<'EOF'
+          GitHub 的 artifact 下载下来是一个「外壳 zip」，里面才是真正的刷机包。
+
+          请先解压下载到的 artifact，再用里面的 ${NAME}.zip 刷机：
+            - Kernel Flasher / Horizon Kernel Flasher 直接刷该 zip
+            - 刷前先备份 boot
+            - 包结构：anykernel.sh + Image.lz4 + tools/ + META-INF/
+
+          想一步到位：手动触发时把 release 选成 true，产物会直接挂到
+          GitHub Releases 页面，手机点一下就能下载（不用解压外壳）。
+          EOF
           unzip -l "$NAME.zip"
 
       - name: Package SUSFS userspace module
@@ -502,17 +513,25 @@ jobs:
           echo "name=$ZIP" >> "$GITHUB_OUTPUT"
           unzip -l "$GITHUB_WORKSPACE/$ZIP" | tail -6
 
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          # 扁平化：把所有产物拷进一个目录再上传，artifact 里就不会再出现
+          # home/runner/work/... 或 tmp/out_gs/... 这种绝对路径层级（容易让人误当成刷机包）
+          STAGE="$GITHUB_WORKSPACE/artifact-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp "${{ steps.package.outputs.name }}.zip" "${{ steps.package.outputs.name }}.zip.sha1" "$STAGE/"
+          cp "$OUT_DIR/arch/arm64/boot/Image.lz4" "$OUT_DIR/System.map" "$STAGE/"
+          cp README-如何刷机.txt "$STAGE/" 2>/dev/null || true
+          cp build-*.log "$STAGE/" 2>/dev/null || true
+          cp susfs4ksu-*.zip susfs4ksu-*.zip.sha1 "$STAGE/" 2>/dev/null || true
+          ls -lh "$STAGE"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
-          path: |
-            ${{ steps.package.outputs.name }}.zip
-            ${{ steps.package.outputs.name }}.zip.sha1
-            ${{ env.OUT_DIR }}/arch/arm64/boot/Image.lz4
-            ${{ env.OUT_DIR }}/System.map
-            susfs4ksu-*.zip
-            susfs4ksu-*.zip.sha1
+          path: artifact-stage/
           if-no-files-found: error
           retention-days: 30
 
