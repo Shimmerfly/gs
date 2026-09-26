@@ -48,9 +48,9 @@ concurrency:
 env:
   ARCH: arm64
   DEFCONFIG: blu_spark_defconfig
-  CLANG_BRANCH: android-gs-bluejay-6.1-android16
-  CLANG_VERSION: clang-r487747c
-  CLANG_DIR: /home/runner/clang-aosp
+  LLVM_TAG: llvmorg-17.0.6
+  LLVM_TARBALL: clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+  CLANG_DIR: /home/runner/llvm17
   KSU_REPO: https://github.com/tiann/KernelSU
   AK3_REPO: https://github.com/osm0sis/AnyKernel3
 
@@ -88,31 +88,31 @@ jobs:
           sudo apt-get clean
           echo "::notice title=disk-after::$(df -h / | tail -1)"
 
-      - name: Cache AOSP clang
+      - name: Cache LLVM toolchain
         id: clang-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.CLANG_DIR }}
-          key: clang-${{ env.CLANG_BRANCH }}-${{ env.CLANG_VERSION }}-v1
+          key: ${{ env.LLVM_TAG }}-v1
 
-      - name: Fetch AOSP clang (${{ env.CLANG_VERSION }})
+      - name: Fetch LLVM ${{ env.LLVM_TAG }}
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
+          # engstk 的 "blu_spark clang 17.0.6" 就是 LLVM 17.0.6（defconfig 里记的
+          # llvm-project commit 6009708b 正是 llvmorg-17.0.6 那个 tag），所以直接用官方发布包
           rm -rf "$CLANG_DIR"
-          # 只稀疏检出需要的那一个 clang，避免拉下整个 prebuilts 仓库
-          git clone --filter=blob:none --no-checkout --depth=1 -b "$CLANG_BRANCH" \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR"
-          cd "$CLANG_DIR"
-          git sparse-checkout init --cone
-          git sparse-checkout set "$CLANG_VERSION"
-          git checkout
+          mkdir -p "$CLANG_DIR"
+          curl -fsSL -o /tmp/llvm.tar.xz \
+            "https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/${LLVM_TARBALL}"
+          tar -xJf /tmp/llvm.tar.xz --strip-components=1 -C "$CLANG_DIR"
+          rm -f /tmp/llvm.tar.xz
 
       - name: Verify clang
         run: |
           set -euo pipefail
-          export PATH="$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
-          echo "$CLANG_DIR/$CLANG_VERSION/bin" >> "$GITHUB_PATH"
+          export PATH="$CLANG_DIR/bin:$PATH"
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
           if ! clang --version; then
             echo "::warning::clang 启动失败，尝试补一个 libtinfo.so.5 兼容链接"
             for lib in /lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.6; do
@@ -197,7 +197,7 @@ jobs:
           KSU_SYNCED: ${{ steps.ksu.outputs.synced }}
         run: |
           set -uo pipefail
-          export PATH="$HOME/ccache-shim:$CLANG_DIR/$CLANG_VERSION/bin:$PATH"
+          export PATH="$HOME/ccache-shim:$CLANG_DIR/bin:$PATH"
           # 说明：这棵树顶层 Makefile 被 eng.stk 定制过（KBUILD_OUTPUT := /tmp/out_gs），
           # 所以命令行不需要也不应该再传 O=，产物一律落在 objtree（下面会探测出来）。
           MAKE_ARGS="ARCH=arm64 LLVM=1 LLVM_IAS=1"
@@ -246,6 +246,18 @@ jobs:
             echo "::warning::读不到 TSK_STACK_CANARY 偏移，跳过 canary 参数"
           fi
 
+          # ---- 治本：让内核永远提供全局 canary ----
+          # KernelSU 的 core/init.c 只在 (MODULE && !PER_TASK) 时才定义 __stack_chk_guard，
+          # 而本内核是「内建 KSU + PER_TASK=y」，于是像 arch/arm64/kvm/stacktrace.o 这种
+          # 仍按 global guard 形式引用它的对象就没人提供符号 → 链接失败。
+          # 这里照 KSU 注释里的思路把它补回内核自身，链接就不再依赖「编译器/LTO 是否
+          # 按 sysreg 形式生成 canary」这种不可控因素了。
+          sed -i 's/#if defined(CONFIG_STACKPROTECTOR) && !defined(CONFIG_STACKPROTECTOR_PER_TASK)/#if defined(CONFIG_STACKPROTECTOR)/' arch/arm64/kernel/process.c
+          sed -i 's/if (!IS_ENABLED(CONFIG_STACKPROTECTOR_PER_TASK))/if (IS_ENABLED(CONFIG_STACKPROTECTOR))/' arch/arm64/include/asm/stackprotector.h
+          grep -q '^#if defined(CONFIG_STACKPROTECTOR)$' arch/arm64/kernel/process.c \
+            && echo "::notice title=canary-patch::process.c 无条件定义 __stack_chk_guard" \
+            || echo "::error title=canary-patch::process.c 补丁没打上"
+
           # ---- 诊断 A：prepare 之后 KBUILD_CFLAGS 里到底有没有这组参数 ----
           make $MAKE_ARGS --eval='kcflags-check: prepare ; @echo "VERIFY_KCFLAGS: $(KBUILD_CFLAGS)"' kcflags-check \
             > build-verify.log 2>&1 || true
@@ -255,7 +267,8 @@ jobs:
           # 注意不能用 make -n：dry-run 不会执行 recipe 里的 $(eval)，看到的命令行是不准的
           rm -f "$OUT_DIR/arch/arm64/kernel/process.o"
           make $MAKE_ARGS V=1 arch/arm64/kernel/process.o > build-oneobj.log 2>&1 || true
-          echo "::notice title=real-guard-flags::$(grep -o -m3 -- '-mstack-protector-guard[^ ]*' build-oneobj.log | tr '\n' ' ')"
+          COMPILE_LINE=$(grep -m1 -- "-o arch/arm64/kernel/process.o" build-oneobj.log) || COMPILE_LINE=""
+          echo "::notice title=compile-guard-flags::$(printf '%s' "$COMPILE_LINE" | grep -o -m3 -- '-mstack-protector-guard[^ ]*' | tr '\n' ' ')"
           echo "::notice title=oneobj-tail::$(tail -n 2 build-oneobj.log | tr '\n' '|' | cut -c1-300)"
 
           run_build() {
@@ -272,7 +285,7 @@ jobs:
 
           # 只有报错确实指向 KSU 时才值得换回仓库内版本；纯粹链接/工具链问题换了也白搭
           KSU_RELATED=no
-          grep -qs "drivers/kernelsu" build-synced.log && KSU_RELATED=yes
+          grep -qsE "drivers/kernelsu/[^ ]+:[0-9]+:[0-9]+: (fatal )?error|drivers/kernelsu[^ ]*\.o\] Error" build-synced.log && KSU_RELATED=yes
           if [ "$rc" -ne 0 ] && [ "${KSU_SYNCED:-}" = "true" ] && [ "$KSU_RELATED" = "yes" ]; then
             echo "::warning::上游 KernelSU 编译失败，回退到仓库内自带 KSU 版本重编"
             echo "---------- 失败日志尾部 ----------"
