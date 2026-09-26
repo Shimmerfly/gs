@@ -32,6 +32,20 @@ on:
         type: choice
         options: ["false", "true"]
         default: "false"
+      susfs:
+        description: "打上 SUSFS（root 隐藏）补丁"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      name_tag:
+        description: "内核名字后缀（uname -r 末尾），留空则不加"
+        required: false
+        default: "shimmerfly"
+      add_timestamp:
+        description: "内核名字里加编译时间戳（UTC+8）"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
   push:
     branches:
       - blu_spark-16-los
@@ -52,6 +66,8 @@ env:
   LLVM_TARBALL: clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz
   CLANG_DIR: /home/runner/llvm17
   KSU_REPO: https://github.com/tiann/KernelSU
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android14-6.1
   AK3_REPO: https://github.com/osm0sis/AnyKernel3
 
 jobs:
@@ -190,11 +206,45 @@ jobs:
           echo "--- 与仓库内版本的差异（前 20 项）---"
           git status --short drivers/kernelsu | head -20 || true
 
+      - name: Apply SUSFS patches
+        id: susfs
+        if: github.event_name == 'workflow_dispatch' && inputs.susfs == 'true'
+        run: |
+          set -euo pipefail
+          # 官方 SUSFS 仓库在 GitLab（GitHub 上同名仓库是空的），master 永久停在 v1.3.8，
+          # 真正的代码在各内核版本分支里 —— 我们用 gki-android14-6.1（就是这棵树）。
+          git clone -q --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu
+          KP=/tmp/susfs4ksu/kernel_patches
+
+          # 1) 内核侧：susfs.c / 头文件 + 各处 hook 补丁（已实测能干净应用在这棵树上）
+          cp "$KP"/fs/* fs/
+          cp "$KP"/include/linux/* include/linux/
+          PATCH=$(ls "$KP"/50_add_susfs_in_*.patch | head -1)
+          echo "::notice title=susfs-kernel-patch::${PATCH##*/}"
+          git apply --verbose "$PATCH" || {
+            echo "::error::内核侧 SUSFS 补丁应用失败（上游代码漂移？）"
+            exit 1
+          }
+
+          # 2) KernelSU 侧：补丁里的路径是 kernel/xxx，而我们的 KSU 在 drivers/kernelsu/
+          git apply --verbose -p2 --directory=drivers/kernelsu/ "$KP/KernelSU/10_enable_susfs_for_ksu.patch" || {
+            echo "::error::KernelSU 侧 SUSFS 补丁应用失败"
+            exit 1
+          }
+
+          # 3) 校验
+          grep -q "susfs" fs/Makefile && echo "::notice title=susfs-fs::fs/Makefile 已挂上 susfs.o"
+          grep -q "KSU_SUSFS" drivers/kernelsu/Kconfig && echo "::notice title=susfs-ksu::KSU Kconfig 已有 KSU_SUSFS"
+          echo "susfs=true" >> "$GITHUB_OUTPUT"
+
       - name: Build kernel
         id: build
         env:
           KSU_COUNT: ${{ steps.ksu.outputs.count }}
           KSU_SYNCED: ${{ steps.ksu.outputs.synced }}
+          NAME_TAG: ${{ inputs.name_tag }}
+          ADD_TS: ${{ inputs.add_timestamp }}
+          SUSFS_ON: ${{ steps.susfs.outputs.susfs }}
         run: |
           set -uo pipefail
           export PATH="$HOME/ccache-shim:$CLANG_DIR/bin:$PATH"
@@ -225,6 +275,36 @@ jobs:
             echo "::error::defconfig 失败"
             tail -n 60 build-config.log || true
             exit 1
+          fi
+
+          # ---- 内核名字：<版本>-<编译时间 UTC+8>-<tag> ----
+          # 只动 objtree 里的 .config，仓库里的 defconfig 保持原样；想还原就把输入留空/关掉时间戳
+          CFG="$OUT_DIR/.config"
+          [ -f "$CFG" ] || CFG=.config
+          LV=""
+          if [ "${ADD_TS:-true}" = "true" ]; then
+            # runner 是 UTC，这里 +8 小时换成猫猫本地时间；只用数字和连字符，Kbuild 不会炸
+            LV="-$(date -u -d '+8 hours' '+%Y%m%d%H%M%S')"
+          fi
+          if [ -n "${NAME_TAG:-}" ]; then
+            LV="${LV}-${NAME_TAG}"
+          fi
+          if [ -n "$LV" ]; then
+            scripts/config --file "$CFG" --set-str LOCALVERSION "$LV" \
+              || echo "::warning::写入 LOCALVERSION 失败"
+            echo "::notice title=kernel-name::uname -r 会是 6.1.x${LV}"
+          fi
+
+          # ---- SUSFS 配置项 ----
+          if [ "${SUSFS_ON:-}" = "true" ]; then
+            scripts/config --file "$CFG" \
+              --enable KSU_SUSFS --enable KSU_SUSFS_SUS_PATH --enable KSU_SUSFS_SUS_MOUNT \
+              --enable KSU_SUSFS_SUS_KSTAT --enable KSU_SUSFS_SPOOF_UNAME --enable KSU_SUSFS_ENABLE_LOG \
+              --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              --enable KSU_SUSFS_OPEN_REDIRECT --enable KSU_SUSFS_SUS_MAP \
+              || echo "::warning::susfs 配置写入失败"
+            make $MAKE_ARGS olddefconfig > build-olddefconfig.log 2>&1 || tail -n 20 build-olddefconfig.log || true
+            echo "::notice title=susfs-config::$(grep -c '^CONFIG_KSU_SUSFS' "$CFG") 个 SUSFS 选项已启用"
           fi
 
           # ---- arm64 per-task stack canary 参数（修 undefined symbol: __stack_chk_guard）----
@@ -363,12 +443,14 @@ jobs:
           KSU_SHA: ${{ steps.ksu.outputs.sha }}
           NOLTO: ${{ steps.build.outputs.nolto }}
           NOSSP: ${{ steps.build.outputs.nossp }}
+          SUSFS_ON: ${{ steps.susfs.outputs.susfs }}
         run: |
           set -euo pipefail
           SHORT_SHA=$(git rev-parse --short=8 HEAD)
           NAME="blu_spark-ci_$(date +%Y%m%d)_${SHORT_SHA}"
           [ "${NOLTO:-}" = "true" ] && NAME="${NAME}-nolto"
           [ "${NOSSP:-}" = "true" ] && NAME="${NAME}-nossp"
+          [ "${SUSFS_ON:-}" = "true" ] && NAME="${NAME}-susfs"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
           # AK3 的 tools 必须是 aarch64！Pixel 6/7/8/9（Tensor）是纯 64 位系统，跑不了
@@ -404,6 +486,22 @@ jobs:
           sha1sum "$NAME.zip" > "$NAME.zip.sha1"
           unzip -l "$NAME.zip"
 
+      - name: Package SUSFS userspace module
+        id: susfs_module
+        if: github.event_name == 'workflow_dispatch' && inputs.susfs == 'true'
+        run: |
+          set -euo pipefail
+          # 官方仓库里已经带了预编译的 aarch64 ksu_susfs，不需要 NDK；
+          # 这里只要按 KernelSU 模块格式（module.prop 在 zip 根目录）打包
+          cd /tmp/susfs4ksu/ksu_module_susfs
+          MODVER=$(sed -n 's/^version=//p' module.prop | tr -d '\r')
+          ZIP="susfs4ksu-${MODVER}-ksu.zip"
+          rm -f "$GITHUB_WORKSPACE/$ZIP"
+          zip -r9 -q "$GITHUB_WORKSPACE/$ZIP" .
+          ( cd "$GITHUB_WORKSPACE" && sha1sum "$ZIP" > "$ZIP.sha1" )
+          echo "name=$ZIP" >> "$GITHUB_OUTPUT"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP" | tail -6
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -413,6 +511,8 @@ jobs:
             ${{ steps.package.outputs.name }}.zip.sha1
             ${{ env.OUT_DIR }}/arch/arm64/boot/Image.lz4
             ${{ env.OUT_DIR }}/System.map
+            susfs4ksu-*.zip
+            susfs4ksu-*.zip.sha1
           if-no-files-found: error
           retention-days: 30
 
@@ -443,8 +543,11 @@ jobs:
             echo
             echo "Flash the zip with Kernel Flasher / Horizon Kernel Flasher / recovery."
           } > /tmp/release-notes.md
+          FILES=("${NAME}.zip" "${NAME}.zip.sha1" "$OUT_DIR/arch/arm64/boot/Image.lz4")
+          # susfs 构建时把用户态模块也一起挂上
+          [ -n "${{ steps.susfs_module.outputs.name }}" ] && FILES+=("${{ steps.susfs_module.outputs.name }}" "${{ steps.susfs_module.outputs.name }}.sha1")
           gh release create "$NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$NAME" \
             --notes-file /tmp/release-notes.md \
-            "${NAME}.zip" "${NAME}.zip.sha1" "$OUT_DIR/arch/arm64/boot/Image.lz4"
+            "${FILES[@]}"
