@@ -371,15 +371,36 @@ jobs:
           [ "${NOSSP:-}" = "true" ] && NAME="${NAME}-nossp"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
-          git clone -q --depth=1 "$AK3_REPO" /tmp/anykernel3
-          rm -rf /tmp/anykernel3/.git /tmp/anykernel3/README.md /tmp/anykernel3/anykernel.sh
-          mkdir -p /tmp/ak3-zip
-          cp -a /tmp/anykernel3/. /tmp/ak3-zip/
+          # AK3 的 tools 必须是 aarch64！Pixel 6/7/8/9（Tensor）是纯 64 位系统，跑不了
+          # 32 位 ARM 二进制；而 osm0sis/AnyKernel3（以及 engstk/AnyKernel3）仓库自带的
+          # busybox/magiskboot/magiskpolicy 都是 32 位 ARM，zip 里带上它们会直接刷不进去：
+          #   .../files/busybox: inaccessible or not found
+          # 所以直接拿 engstk 官方 release 的 AK3 包当基底（他的 tools/META-INF 是 aarch64），
+          # 只把 Image.lz4 和 anykernel.sh 换成我们编出来的。
+          BASE_URL=$(curl -fsSL "https://api.github.com/repos/engstk/gs/releases/latest" \
+            | python3 -c "import json,sys;d=json.load(sys.stdin);a=[x['browser_download_url'] for x in d.get('assets',[]) if x['name'].endswith('.zip')];print(a[0] if a else '')")
+          if [ -z "$BASE_URL" ]; then
+            echo "::error::拿不到 engstk 官方 AK3 包地址（网络问题或 release 结构变化）"
+            exit 1
+          fi
+          echo "::notice title=ak3-base::${BASE_URL##*/}"
+          curl -fsSL -o /tmp/ak3base.zip "$BASE_URL"
+          rm -rf /tmp/ak3-zip && mkdir -p /tmp/ak3-zip
+          unzip -o -q /tmp/ak3base.zip -d /tmp/ak3-zip
+          rm -f /tmp/ak3-zip/anykernel.sh
           cp .github/ak3/anykernel.sh /tmp/ak3-zip/anykernel.sh
           cp .github/ak3/banner /tmp/ak3-zip/banner
           cp "$OUT_DIR/arch/arm64/boot/Image.lz4" /tmp/ak3-zip/Image.lz4
 
-          ( cd /tmp/ak3-zip && zip -r9 -q "$GITHUB_WORKSPACE/$NAME.zip" . -x 'modules/*' 'patch/*' 'ramdisk/*' )
+          # 架构硬检查：打包前确认 tools 是 64 位，别再产出刷不进去的包
+          file /tmp/ak3-zip/tools/busybox | grep -q "32-bit" && {
+            echo "::error::AK3 tools/busybox 是 32 位 ARM，Pixel 上无法执行，拒绝打包"
+            exit 1
+          }
+          echo "::notice title=ak3-tools::$(file -b /tmp/ak3-zip/tools/busybox)"
+
+          ( cd /tmp/ak3-zip && zip -r9 -q "$GITHUB_WORKSPACE/$NAME.zip" . \
+              -x 'modules/*' 'patch/*' 'ramdisk/*' '.github/*' '.gitignore' )
           sha1sum "$NAME.zip" > "$NAME.zip.sha1"
           unzip -l "$NAME.zip"
 
