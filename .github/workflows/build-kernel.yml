@@ -9,7 +9,7 @@
 #                编不过时自动回退仓库内自带版本（仅在报错真指向 kernelsu 时）
 #   SUSFS      : susfs=true（手动默认 true、定时默认 true）时打上官方 6.1 分支补丁，
 #                并把预编译的 aarch64 ksu_susfs 打成 KernelSU 模块一起出
-#   内核名字   : uname -r = 6.1.145-<北京时间戳>-<name_tag>（构建时改 objtree 的 .config）
+#   内核名字   : uname -r = 6.1.145-<name_tag>（默认 6.1.145-Shimmerfly；可选加北京时间戳）
 #   定时       : 每天 16:00 UTC（= 北京时间 00:00）检查 KSU 新 commit，没有就跳过
 #   产物       : AK3 刷机 zip（AK3 tools 必须是 aarch64）+ Image.lz4 + System.map +
 #                susfs 模块 zip；artifact 已扁平化，解压一次即为可刷的 zip
@@ -50,12 +50,12 @@ on:
       name_tag:
         description: "内核名字后缀（uname -r 末尾），留空则不加"
         required: false
-        default: "shimmerfly"
+        default: "Shimmerfly"
       add_timestamp:
-        description: "内核名字里加编译时间戳（UTC+8）"
+        description: "内核名字里加编译时间戳（UTC+8，默认不加）"
         type: choice
-        options: ["true", "false"]
-        default: "true"
+        options: ["false", "true"]
+        default: "false"
   push:
     branches:
       - blu_spark-16-los
@@ -302,8 +302,8 @@ jobs:
         env:
           KSU_COUNT: ${{ steps.ksu.outputs.count }}
           KSU_SYNCED: ${{ steps.ksu.outputs.synced }}
-          NAME_TAG: ${{ inputs.name_tag || 'shimmerfly' }}
-          ADD_TS: ${{ inputs.add_timestamp || 'true' }}
+          NAME_TAG: ${{ inputs.name_tag || 'Shimmerfly' }}
+          ADD_TS: ${{ inputs.add_timestamp || 'false' }}
           SUSFS_ON: ${{ steps.susfs.outputs.susfs }}
         run: |
           set -uo pipefail
