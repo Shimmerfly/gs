@@ -16,6 +16,9 @@
 name: Build Kernel (blu_spark-16-los)
 
 on:
+  schedule:
+    # GitHub 的 cron 用 UTC：16:00 UTC = 北京时间 00:00（每天早上 0 点）
+    - cron: '0 16 * * *'
   workflow_dispatch:
     inputs:
       ksu_ref:
@@ -70,10 +73,60 @@ env:
   SUSFS_BRANCH: gki-android14-6.1
 
 jobs:
+  # 定时任务专用：先看 KernelSU 上游有没有新 commit，没变就不进构建
+  check:
+    name: Check KernelSU upstream
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      ksu_sha: ${{ steps.decide.outputs.ksu_sha }}
+    steps:
+      - name: Resolve latest KernelSU commit
+        id: decide
+        run: |
+          set -euo pipefail
+          KSU_SHA=$(git ls-remote https://github.com/tiann/KernelSU refs/heads/main | cut -f1)
+          if [ -z "$KSU_SHA" ]; then
+            echo "::error::拿不到 KernelSU main 的最新 commit"
+            exit 1
+          fi
+          echo "ksu_sha=$KSU_SHA" >> "$GITHUB_OUTPUT"
+          echo "::notice title=ksu-latest::KernelSU main = $KSU_SHA"
+
+      - name: Look for a previous build of this commit
+        id: cache
+        if: github.event_name == 'schedule'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ksu-built
+          key: ksu-built-${{ steps.decide.outputs.ksu_sha }}
+
+      - name: Decide whether to build
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=gate::非定时触发，直接构建"
+            exit 0
+          fi
+          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=gate::KernelSU ${{ steps.decide.outputs.ksu_sha }} 已经编译过，本次直接结束"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=gate::发现新的 KernelSU commit（${{ steps.decide.outputs.ksu_sha }}），开始构建"
+          fi
+
   build:
     name: Build kernel
+    needs: [check]
+    if: needs.check.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    env:
+      # 定时构建默认出 susfs 版；手动触发按输入的开关；push 保持普通版
+      SUSFS_WANTED: ${{ github.event_name == 'schedule' && 'true' || inputs.susfs }}
 
     steps:
       - name: Checkout
@@ -207,7 +260,7 @@ jobs:
 
       - name: Apply SUSFS patches
         id: susfs
-        if: github.event_name == 'workflow_dispatch' && inputs.susfs == 'true'
+        if: env.SUSFS_WANTED == 'true'
         run: |
           set -euo pipefail
           # 官方 SUSFS 仓库在 GitLab（GitHub 上同名仓库是空的），master 永久停在 v1.3.8，
@@ -241,8 +294,8 @@ jobs:
         env:
           KSU_COUNT: ${{ steps.ksu.outputs.count }}
           KSU_SYNCED: ${{ steps.ksu.outputs.synced }}
-          NAME_TAG: ${{ inputs.name_tag }}
-          ADD_TS: ${{ inputs.add_timestamp }}
+          NAME_TAG: ${{ inputs.name_tag || 'shimmerfly' }}
+          ADD_TS: ${{ inputs.add_timestamp || 'true' }}
           SUSFS_ON: ${{ steps.susfs.outputs.susfs }}
         run: |
           set -uo pipefail
@@ -499,7 +552,7 @@ jobs:
 
       - name: Package SUSFS userspace module
         id: susfs_module
-        if: github.event_name == 'workflow_dispatch' && inputs.susfs == 'true'
+        if: env.SUSFS_WANTED == 'true'
         run: |
           set -euo pipefail
           # 官方仓库里已经带了预编译的 aarch64 ksu_susfs，不需要 NDK；
@@ -572,3 +625,20 @@ jobs:
             --title "$NAME" \
             --notes-file /tmp/release-notes.md \
             "${FILES[@]}"
+
+  # 只有真正编译成功了才记录这个 KernelSU commit（失败的话下次定时会重试）
+  mark:
+    name: Record built KernelSU commit
+    needs: [check, build]
+    if: github.event_name == 'schedule' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Save marker
+        run: |
+          mkdir -p .ksu-built
+          echo "${{ needs.check.outputs.ksu_sha }}" > .ksu-built/last-built
+          cat .ksu-built/last-built
+      - uses: actions/cache/save@v4
+        with:
+          path: .ksu-built
+          key: ksu-built-${{ needs.check.outputs.ksu_sha }}
