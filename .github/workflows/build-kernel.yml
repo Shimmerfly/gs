@@ -68,7 +68,6 @@ env:
   KSU_REPO: https://github.com/tiann/KernelSU
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
   SUSFS_BRANCH: gki-android14-6.1
-  AK3_REPO: https://github.com/osm0sis/AnyKernel3
 
 jobs:
   build:
@@ -293,6 +292,7 @@ jobs:
             scripts/config --file "$CFG" --set-str LOCALVERSION "$LV" \
               || echo "::warning::写入 LOCALVERSION 失败"
             echo "::notice title=kernel-name::uname -r 会是 6.1.x${LV}"
+            echo "KERNEL_NAME=6.1.x${LV}" >> "$GITHUB_ENV"
           fi
 
           # ---- SUSFS 配置项 ----
@@ -546,6 +546,7 @@ jobs:
 
       - name: Create GitHub Release
         if: github.event_name == 'workflow_dispatch' && inputs.release == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KSU_SHA: ${{ steps.ksu.outputs.sha }}
@@ -556,8 +557,9 @@ jobs:
             echo "Automatic CI build of \`blu_spark-16-los\` ($(git rev-parse --short=12 HEAD))"
             echo
             echo "- defconfig: \`$DEFCONFIG\`"
-            echo "- toolchain: \`$CLANG_VERSION\`"
+            echo "- toolchain: \`${LLVM_TAG:-LLVM}\`"
             echo "- KernelSU: \`${KSU_SHA:-in-tree}\`"
+            echo "- kernel name: \`${KERNEL_NAME:-unknown}\`"
             echo "- Image.lz4 sha1: \`$(sha1sum "$OUT_DIR/arch/arm64/boot/Image.lz4" | cut -d' ' -f1)\`"
             echo
             echo "Flash the zip with Kernel Flasher / Horizon Kernel Flasher / recovery."
