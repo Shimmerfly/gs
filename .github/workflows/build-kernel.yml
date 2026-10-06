@@ -237,8 +237,13 @@ jobs:
 
           # 官方 SUSFS 仓库在 GitLab（GitHub 上同名仓库是空的），master 永久停在 v1.3.8，
           # 真正的代码在各内核版本分支里 —— 我们用 gki-android14-6.1（就是这棵树）。
-          git clone -q --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu \
-            || skip "拉取 SUSFS 仓库失败"
+          # GitLab 到 runner 偶发抽风，重试几次再决定放弃
+          ok=""
+          for i in 1 2 3 4; do
+            if git clone -q --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu 2>/dev/null; then ok=1; break; fi
+            rm -rf /tmp/susfs4ksu; echo "  第 $i 次拉取 SUSFS 仓库失败，重试…"; sleep 8
+          done
+          [ -n "$ok" ] || skip "拉取 SUSFS 仓库失败（已重试 4 次）"
           KP=$(ls /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -1)
           KSUP=/tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
           [ -n "$KP" ] || skip "SUSFS 仓库里找不到内核侧补丁"
@@ -601,7 +606,7 @@ jobs:
 
       - name: Package SUSFS userspace module
         id: susfs_module
-        if: env.SUSFS_WANTED == 'true'
+        if: steps.susfs.outputs.susfs == 'true'
         run: |
           set -euo pipefail
           # 官方仓库里已经带了预编译的 aarch64 ksu_susfs，不需要 NDK；
@@ -616,6 +621,7 @@ jobs:
           unzip -l "$GITHUB_WORKSPACE/$ZIP" | tail -6
 
       - name: Stage artifacts
+        if: always()
         run: |
           set -euo pipefail
           # 扁平化：把所有产物拷进一个目录再上传，artifact 里就不会再出现
@@ -630,11 +636,12 @@ jobs:
           ls -lh "$STAGE"
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
           path: artifact-stage/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Upload build logs
