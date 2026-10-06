@@ -8,7 +8,9 @@
 #   KernelSU   : 每次默认从 tiann/KernelSU main 拉最新覆盖 drivers/kernelsu；
 #                编不过时自动回退仓库内自带版本（仅在报错真指向 kernelsu 时）
 #   SUSFS      : susfs=true（手动默认 true、定时默认 true）时打上官方 6.1 分支补丁，
-#                并把预编译的 aarch64 ksu_susfs 打成 KernelSU 模块一起出
+#                并把预编译的 aarch64 ksu_susfs 打成 KernelSU 模块一起出。
+#                补丁一旦跟不上最新 KernelSU（或内核源码），就整场放弃 SUSFS 出普通内核，
+#                CI 不会因此失败（2026-10 的两次红就是 KSU main 前进、补丁失配）
 #   内核名字   : uname -r = 6.1.145-<name_tag>（默认 6.1.145-Shimmerfly；可选加北京时间戳）
 #   定时       : 每天 16:00 UTC（= 北京时间 00:00）检查 KSU 新 commit，没有就跳过
 #   产物       : AK3 刷机 zip（AK3 tools 必须是 aarch64）+ Image.lz4 + System.map +
@@ -219,11 +221,51 @@ jobs:
           ccache -z
           ccache --version | head -1
 
+      - name: Fetch and verify SUSFS patches
+        id: susfs
+        if: env.SUSFS_WANTED == 'true'
+        run: |
+          set -uo pipefail
+          # SUSFS 只当加分项：内核侧或 KernelSU 侧补丁只要有任意一侧配不上当前的
+          # 源码，就整场放弃 SUSFS 出一个普通内核，绝不让 CI 因此变红。
+          #（2026-10 的两次失败就是 KSU main 往前走了、susfs 的 KSU 补丁跟不上。）
+          skip() {
+            echo "::warning title=susfs-skip::$1，本次构建不集成 SUSFS（出普通内核）"
+            echo "susfs=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # 官方 SUSFS 仓库在 GitLab（GitHub 上同名仓库是空的），master 永久停在 v1.3.8，
+          # 真正的代码在各内核版本分支里 —— 我们用 gki-android14-6.1（就是这棵树）。
+          git clone -q --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu \
+            || skip "拉取 SUSFS 仓库失败"
+          KP=$(ls /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -1)
+          KSUP=/tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          [ -n "$KP" ] || skip "SUSFS 仓库里找不到内核侧补丁"
+          [ -f "$KSUP" ] || skip "SUSFS 仓库里找不到 KernelSU 侧补丁"
+          echo "KSUP=$KSUP" >> "$GITHUB_ENV"
+
+          # 内核侧：对着刚 checkout 出来的内核源码 dry-run
+          git apply --check "$KP" || skip "内核侧补丁 ${KP##*/} 配不上当前内核源码"
+
+          # KernelSU 侧：对着最新 main dry-run（这一步也顺带把可信的 KSU commit 定下来）
+          rm -rf /tmp/KernelSU-probe
+          git clone -q --depth=1 "$KSU_REPO" /tmp/KernelSU-probe || skip "拉取 KernelSU 校验副本失败"
+          if ! ( cd /tmp/KernelSU-probe && git apply --check "$KSUP" ); then
+            skip "KernelSU 侧补丁配不上最新 KSU（$(git -C /tmp/KernelSU-probe rev-parse --short HEAD)）"
+          fi
+
+          KSU_SHA=$(git -C /tmp/KernelSU-probe rev-parse HEAD)
+          echo "ksu_sha=$KSU_SHA" >> "$GITHUB_OUTPUT"
+          echo "susfs=true" >> "$GITHUB_OUTPUT"
+          echo "::notice title=susfs::内核侧 + KernelSU 侧补丁都能干净应用（KSU ${KSU_SHA:0:12}），本次带 SUSFS"
+
       - name: Sync KernelSU from upstream
         id: ksu
         if: github.event_name != 'workflow_dispatch' || inputs.sync_ksu == 'true'
         env:
-          KSU_REF: ${{ inputs.ksu_ref || 'main' }}
+          # 优先级：手动指定的 ref > SUSFS 预检确认过的 KSU commit > main
+          KSU_REF: ${{ inputs.ksu_ref || steps.susfs.outputs.ksu_sha || 'main' }}
         run: |
           set -uo pipefail
 
@@ -237,9 +279,11 @@ jobs:
           # 又不用把全部 blob 拉下来。注意千万不能加 --depth=1，否则历史被截断、count 变成 1
           git clone -q --filter=blob:none --no-checkout "$KSU_REPO" /tmp/KernelSU \
             || fail_sync "克隆 KernelSU 失败"
-          git -C /tmp/KernelSU fetch -q origin "$KSU_REF" || true
-          git -C /tmp/KernelSU checkout -q --detach FETCH_HEAD 2>/dev/null \
-            || git -C /tmp/KernelSU checkout -q --detach "$KSU_REF" \
+          # 直接按 ref 检出（SUSFS 预检给的可能是 main 上的某个 sha，它本来就在完整历史里）；
+          # 只有查不到时才回退去 fetch，避免 FETCH_HEAD 残留导致检出到别的提交
+          git -C /tmp/KernelSU checkout -q --detach "$KSU_REF" 2>/dev/null \
+            || { git -C /tmp/KernelSU fetch -q origin "$KSU_REF" \
+                 && git -C /tmp/KernelSU checkout -q --detach FETCH_HEAD; } \
             || fail_sync "检出 KernelSU ref=$KSU_REF 失败"
 
           KSU_COUNT=$(git -C /tmp/KernelSU rev-list --count HEAD)
@@ -250,6 +294,16 @@ jobs:
           echo "sha=$KSU_SHA" >> "$GITHUB_OUTPUT"
           echo "synced=true" >> "$GITHUB_OUTPUT"
           echo "KernelSU $KSU_REF @ $KSU_SHA (commit count $KSU_COUNT => KSU_VERSION $((30000 + KSU_COUNT)))"
+
+          # SUSFS 的 KernelSU 侧补丁必须在这个克隆里打：补丁 index 行指向的上游 blob
+          # 只存在于 KSU 仓库，先拷到我们树里再打会找不到对象而失败。
+          if [ "${{ steps.susfs.outputs.susfs }}" = "true" ]; then
+            if git -C /tmp/KernelSU apply --verbose "$KSUP"; then
+              echo "::notice title=susfs-ksu::KernelSU 侧 SUSFS 补丁已应用（Kconfig 里 $(grep -c 'KSU_SUSFS' /tmp/KernelSU/kernel/Kconfig) 项）"
+            else
+              fail_sync "KernelSU 侧 SUSFS 补丁应用失败"
+            fi
+          fi
 
           rm -rf drivers/kernelsu
           mkdir -p drivers/kernelsu
@@ -267,35 +321,22 @@ jobs:
           git status --short drivers/kernelsu | head -20 || true
 
       - name: Apply SUSFS patches
-        id: susfs
-        if: env.SUSFS_WANTED == 'true'
+        if: steps.susfs.outputs.susfs == 'true'
         run: |
           set -euo pipefail
-          # 官方 SUSFS 仓库在 GitLab（GitHub 上同名仓库是空的），master 永久停在 v1.3.8，
-          # 真正的代码在各内核版本分支里 —— 我们用 gki-android14-6.1（就是这棵树）。
-          git clone -q --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu
-          KP=/tmp/susfs4ksu/kernel_patches
+          # 预检步骤已经确认过补丁能干净应用，这里只负责落到源码树上
+          #（KernelSU 侧在同步步骤里、于 KSU 克隆内应用：补丁 index 行指向的上游 blob
+          #  只存在于 KSU 仓库，拷到我们树里再打会找不到对象）
+          PATCHDIR=/tmp/susfs4ksu/kernel_patches
+          PATCH=$(ls "$PATCHDIR"/50_add_susfs_in_*.patch | head -1)
 
-          # 1) 内核侧：susfs.c / 头文件 + 各处 hook 补丁（已实测能干净应用在这棵树上）
-          cp "$KP"/fs/* fs/
-          cp "$KP"/include/linux/* include/linux/
-          PATCH=$(ls "$KP"/50_add_susfs_in_*.patch | head -1)
-          echo "::notice title=susfs-kernel-patch::${PATCH##*/}"
-          git apply --verbose "$PATCH" || {
-            echo "::error::内核侧 SUSFS 补丁应用失败（上游代码漂移？）"
-            exit 1
-          }
+          cp "$PATCHDIR"/fs/* fs/
+          cp "$PATCHDIR"/include/linux/* include/linux/
+          echo "::notice title=susfs-kernel-patch::$(basename "$PATCH")"
+          git apply --verbose "$PATCH"
 
-          # 2) KernelSU 侧：补丁里的路径是 kernel/xxx，而我们的 KSU 在 drivers/kernelsu/
-          git apply --verbose -p2 --directory=drivers/kernelsu/ "$KP/KernelSU/10_enable_susfs_for_ksu.patch" || {
-            echo "::error::KernelSU 侧 SUSFS 补丁应用失败"
-            exit 1
-          }
-
-          # 3) 校验
           grep -q "susfs" fs/Makefile && echo "::notice title=susfs-fs::fs/Makefile 已挂上 susfs.o"
           grep -q "KSU_SUSFS" drivers/kernelsu/Kconfig && echo "::notice title=susfs-ksu::KSU Kconfig 已有 KSU_SUSFS"
-          echo "susfs=true" >> "$GITHUB_OUTPUT"
 
       - name: Build kernel
         id: build
